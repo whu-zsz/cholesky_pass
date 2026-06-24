@@ -1,0 +1,13 @@
+{
+  "pass_plugin": "pass/libcontestant_pass.so",
+  "pass_pipeline": "contestant-pass",
+  "runtime_libs": [
+    "runtime/libcontestant_runtime.a"
+  ],
+  "runtime_objects": [],
+  "compile_flags": [],
+  "link_flags": [
+    "-pthread"
+  ],
+  "pass_opt_flags": []
+}

@@ -11,7 +11,6 @@
 
 using namespace llvm;
 
-// 描述一个算子调用的读写信息
 struct TaskInfo {
     CallInst   *call;
     std::string name;
@@ -24,37 +23,23 @@ struct CholeleskyPass : PassInfoMixin<CholeleskyPass> {
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
         LLVMContext &Ctx = M.getContext();
 
-        // 基础类型
-        Type *VoidTy    = Type::getVoidTy(Ctx);
-        Type *Int32Ty   = Type::getInt32Ty(Ctx);
+        Type *VoidTy       = Type::getVoidTy(Ctx);
+        Type *Int32Ty      = Type::getInt32Ty(Ctx);
         PointerType *PtrTy = PointerType::getUnqual(Ctx);
 
-        // 声明运行时函数
-        // void runtime_init(int)
         FunctionCallee RuntimeInit = M.getOrInsertFunction(
             "runtime_init",
             FunctionType::get(VoidTy, {Int32Ty}, false));
-
-        // void runtime_submit(void(*)(void**), void**, int,
-        //                     void*, void**, int)
         FunctionCallee RuntimeSubmit = M.getOrInsertFunction(
             "runtime_submit",
             FunctionType::get(VoidTy,
-                {PtrTy, PtrTy, Int32Ty, PtrTy, PtrTy, Int32Ty},
-                false));
-
-        // void runtime_wait_all()
+                {PtrTy, PtrTy, Int32Ty, PtrTy, PtrTy, Int32Ty}, false));
         FunctionCallee RuntimeWaitAll = M.getOrInsertFunction(
             "runtime_wait_all",
             FunctionType::get(VoidTy, {}, false));
-
-        // void runtime_destroy()
         FunctionCallee RuntimeDestroy = M.getOrInsertFunction(
             "runtime_destroy",
             FunctionType::get(VoidTy, {}, false));
-
-        // 声明三个wrapper函数（在runtime.c里实现）
-        // void cholesky_wrapper(void**)
         FunctionCallee CholeskyWrapper = M.getOrInsertFunction(
             "cholesky_wrapper",
             FunctionType::get(VoidTy, {PtrTy}, false));
@@ -64,12 +49,11 @@ struct CholeleskyPass : PassInfoMixin<CholeleskyPass> {
         FunctionCallee MaddWrapper = M.getOrInsertFunction(
             "madd_wrapper",
             FunctionType::get(VoidTy, {PtrTy}, false));
-        errs() << "[Pass] running on module\n";
+
         for (auto &F : M) {
-            errs() << "[Pass] seeing function: " << F.getName() << "\n"; 
-            if (F.getName() != "block_cholesky") continue;
-            errs() << "[Pass] entered block_cholesky\n";
-            // 收集所有算子调用
+            if (F.isDeclaration()) continue;
+
+            // 收集算子调用
             std::vector<TaskInfo> tasks;
             for (auto &BB : F) {
                 for (auto &I : BB) {
@@ -77,16 +61,12 @@ struct CholeleskyPass : PassInfoMixin<CholeleskyPass> {
                     if (!CI) continue;
                     auto *callee = CI->getCalledFunction();
                     if (!callee) continue;
-
                     StringRef name = callee->getName();
-                    if (name != "cholesky" &&
-                        name != "trsm"     &&
-                        name != "madd") continue;
+                    if (name != "cholesky" && name != "trsm" && name != "madd") continue;
 
                     TaskInfo t;
                     t.call = CI;
                     t.name = name.str();
-
                     if (name == "cholesky") {
                         t.read_ptrs.push_back(CI->getArgOperand(0));
                         t.write_ptr = CI->getArgOperand(1);
@@ -94,7 +74,7 @@ struct CholeleskyPass : PassInfoMixin<CholeleskyPass> {
                         t.read_ptrs.push_back(CI->getArgOperand(0));
                         t.read_ptrs.push_back(CI->getArgOperand(1));
                         t.write_ptr = CI->getArgOperand(2);
-                    } else { // madd
+                    } else {
                         t.read_ptrs.push_back(CI->getArgOperand(0));
                         t.read_ptrs.push_back(CI->getArgOperand(1));
                         t.write_ptr = CI->getArgOperand(2);
@@ -103,16 +83,52 @@ struct CholeleskyPass : PassInfoMixin<CholeleskyPass> {
                 }
             }
 
-            errs() << "[Pass] found " << tasks.size()
-                   << " operator calls\n";
+            if (tasks.empty()) continue;
 
-            // 在函数入口插入 runtime_init(4)
-            IRBuilder<> EntryBuilder(
-                &*F.getEntryBlock().getFirstInsertionPt());
+            errs() << "[Pass] instrumenting function: "
+                   << F.getName() << " (" << tasks.size()
+                   << " operator calls)\n";
+
+            // 在函数入口插入 runtime_init
+            // 同时在入口预分配所有 alloca（避免在循环体内反复分配栈空间）
+            BasicBlock &EntryBB = F.getEntryBlock();
+            IRBuilder<> EntryBuilder(&*EntryBB.getFirstInsertionPt());
             EntryBuilder.CreateCall(RuntimeInit,
-                {ConstantInt::get(Int32Ty, 4)});
+                {ConstantInt::get(Int32Ty, 8)});
 
-            // 在函数所有return前插入 runtime_wait_all + runtime_destroy
+            // 预分配每个task的args/reads数组和整数slot
+            // 这些alloca全部放在入口块，不随循环迭代重复分配
+            std::vector<Value*> argsArrays;
+            std::vector<Value*> readsArrays;
+            std::vector<std::vector<Value*>> allArgSlots;
+
+            for (auto &t : tasks) {
+                int nargs  = (t.name == "cholesky") ? 4 : 5;
+                int nreads = (t.name == "cholesky") ? 1 : 2;
+
+                Value *argsArr = EntryBuilder.CreateAlloca(
+                    PtrTy, ConstantInt::get(Int32Ty, nargs), "args_pre");
+                Value *readsArr = EntryBuilder.CreateAlloca(
+                    PtrTy, ConstantInt::get(Int32Ty, nreads), "reads_pre");
+
+                std::vector<Value*> slots;
+                for (unsigned i = 0; i < t.call->arg_size(); i++) {
+                    Value *arg = t.call->getArgOperand(i);
+                    if (arg->getType()->isIntegerTy()) {
+                        Value *slot = EntryBuilder.CreateAlloca(
+                            arg->getType(), nullptr, "int_slot");
+                        slots.push_back(slot);
+                    } else {
+                        slots.push_back(nullptr);
+                    }
+                }
+
+                argsArrays.push_back(argsArr);
+                readsArrays.push_back(readsArr);
+                allArgSlots.push_back(slots);
+            }
+
+            // 在所有 return 前插入 runtime_wait_all + runtime_destroy
             for (auto &BB : F) {
                 auto *ret = dyn_cast<ReturnInst>(BB.getTerminator());
                 if (!ret) continue;
@@ -121,64 +137,50 @@ struct CholeleskyPass : PassInfoMixin<CholeleskyPass> {
                 RetBuilder.CreateCall(RuntimeDestroy, {});
             }
 
-            // 替换每个算子调用为 runtime_submit
-            for (auto &t : tasks) {
+            // 在每个调用点替换为 runtime_submit（只做 store，不做 alloca）
+            for (size_t idx = 0; idx < tasks.size(); idx++) {
+                auto &t = tasks[idx];
                 CallInst *CI = t.call;
-                IRBuilder<> B(CI);  // 在原调用位置插入
+                IRBuilder<> B(CI);
 
-                // 确定wrapper和参数个数
                 FunctionCallee wrapper;
                 int nargs, nreads;
                 if (t.name == "cholesky") {
-                    wrapper = CholeskyWrapper;
-                    nargs = 4; nreads = 1;
+                    wrapper = CholeskyWrapper; nargs = 4; nreads = 1;
                 } else if (t.name == "trsm") {
-                    wrapper = TrsmWrapper;
-                    nargs = 6; nreads = 2;
+                    wrapper = TrsmWrapper; nargs = 5; nreads = 2;
                 } else {
-                    wrapper = MaddWrapper;
-                    nargs = 6; nreads = 2;
+                    wrapper = MaddWrapper; nargs = 5; nreads = 2;
                 }
 
-                // 分配 args 数组（在栈上）：void* args[nargs]
-                Value *argsArray = B.CreateAlloca(
-                    PtrTy,
-                    ConstantInt::get(Int32Ty, nargs),
-                    "args");
+                Value *argsArray  = argsArrays[idx];
+                Value *readsArray = readsArrays[idx];
 
-                // 把每个参数存进 args[i]
+                // 把参数存入预分配的args数组
                 for (unsigned i = 0; i < CI->arg_size(); i++) {
                     Value *arg = CI->getArgOperand(i);
-                    // 如果是整数，先alloca一个int存起来，传地址
                     if (arg->getType()->isIntegerTy()) {
-                        Value *slot = B.CreateAlloca(
-                            arg->getType(), nullptr, "arg_slot");
+                        Value *slot = allArgSlots[idx][i];
                         B.CreateStore(arg, slot);
-                        arg = slot;  // 传指针
+                        arg = slot;
                     }
-                    Value *gep = B.CreateConstGEP1_32(
-                        PtrTy, argsArray, i);
+                    Value *gep = B.CreateConstGEP1_32(PtrTy, argsArray, i);
                     B.CreateStore(arg, gep);
                 }
 
-                // 分配 read_ptrs 数组
-                Value *readsArray = B.CreateAlloca(
-                    PtrTy,
-                    ConstantInt::get(Int32Ty, nreads),
-                    "reads");
+                // 把读指针存入预分配的reads数组
                 for (int i = 0; i < nreads; i++) {
-                    Value *gep = B.CreateConstGEP1_32(
-                        PtrTy, readsArray, i);
+                    Value *gep = B.CreateConstGEP1_32(PtrTy, readsArray, i);
                     B.CreateStore(t.read_ptrs[i], gep);
                 }
 
-                // 调用 runtime_submit
+                // 插入 runtime_submit 调用
                 B.CreateCall(RuntimeSubmit, {
-                    wrapper.getCallee(),   // func
-                    argsArray,             // args
+                    wrapper.getCallee(),
+                    argsArray,
                     ConstantInt::get(Int32Ty, nargs),
-                    t.write_ptr,           // write_ptr
-                    readsArray,            // read_ptrs
+                    t.write_ptr,
+                    readsArray,
                     ConstantInt::get(Int32Ty, nreads)
                 });
 
@@ -194,12 +196,12 @@ struct CholeleskyPass : PassInfoMixin<CholeleskyPass> {
 extern "C" LLVM_ATTRIBUTE_WEAK
 PassPluginLibraryInfo llvmGetPassPluginInfo() {
     return {
-        LLVM_PLUGIN_API_VERSION, "CholeleskyPass", "v0.1",
+        LLVM_PLUGIN_API_VERSION, "CholeleskyPass", "v0.3",
         [](PassBuilder &PB) {
             PB.registerPipelineParsingCallback(
                 [](StringRef Name, ModulePassManager &MPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
-                    if (Name == "cholesky-parallel") {
+                    if (Name == "contestant-pass") {
                         MPM.addPass(CholeleskyPass());
                         return true;
                     }

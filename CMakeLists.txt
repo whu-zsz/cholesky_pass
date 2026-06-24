@@ -1,26 +1,49 @@
 cmake_minimum_required(VERSION 3.16)
-project(CholeleskyPass CXX C)
+project(Compiler2026ContestantPass LANGUAGES C CXX)
 
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 指向你刚编译的 LLVM（改为你的实际路径；这里必须写绝对路径，不能写 ~）
+# 指向LLVM构建目录
+set(LLVM_BUILD_DIR "/home/whu_zsz/compiler_contest/llvm-project/build"
+    CACHE PATH "LLVM build directory")
+
 find_package(LLVM REQUIRED CONFIG
-    PATHS /home/whu_zsz/llvm-project/build
+    PATHS ${LLVM_BUILD_DIR}
     NO_DEFAULT_PATH)
 
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 
 include(AddLLVM)
 include_directories(${LLVM_INCLUDE_DIRS})
+include_directories(/home/whu_zsz/compiler_contest/llvm-project/build/include)
 add_definitions(${LLVM_DEFINITIONS})
 
-# Pass 编译为动态库（毕昇编译器通过 -fpass-plugin 加载）
-add_llvm_pass_plugin(CholeleskyPass
+# Pass动态库，输出到 build/pass/libcontestant_pass.so
+add_llvm_pass_plugin(contestant_pass
     lib/CholeleskyPass.cpp
 )
+set_target_properties(contestant_pass PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/pass"
+)
 
-# 运行时库编译为静态库
-add_library(cholesky_runtime STATIC runtime/runtime.c)
-target_include_directories(cholesky_runtime PUBLIC runtime/)
-target_compile_options(cholesky_runtime PRIVATE -O2 -pthread)
-target_link_libraries(cholesky_runtime pthread)
+# 运行时静态库，输出到 build/runtime/libcontestant_runtime.a
+add_library(contestant_runtime STATIC
+    runtime/runtime.c
+)
+target_include_directories(contestant_runtime PUBLIC runtime/)
+target_compile_options(contestant_runtime PRIVATE -O2 -std=c11)
+target_link_libraries(contestant_runtime pthread)
+set_target_properties(contestant_runtime PROPERTIES
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/runtime"
+    OUTPUT_NAME "contestant_runtime"
+)
+
+# 复制manifest.json到build目录
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/manifest.json
+    ${CMAKE_BINARY_DIR}/manifest.json
+    COPYONLY
+)
