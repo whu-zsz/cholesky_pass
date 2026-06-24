@@ -3,3 +3,9 @@ build/
 *.so
 *.a
 *.ll
+test/serial
+test/parallel
+test/block_cholesky_parallel
+test/block_cholesky_serial
+test/test_runtime
+test/*.ll

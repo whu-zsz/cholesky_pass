@@ -1,49 +1,76 @@
 cmake_minimum_required(VERSION 3.16)
-project(Compiler2026ContestantPass LANGUAGES C CXX)
+project(Compiler2026Contestant LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 指向LLVM构建目录
-set(LLVM_BUILD_DIR "/home/whu_zsz/compiler_contest/llvm-project/build"
-    CACHE PATH "LLVM build directory")
+# ── 查找 LLVM ──────────────────────────────────────
+find_program(LLVM_CONFIG
+    NAMES llvm-config llvm-config-17 llvm-config-18 llvm-config-19 llvm-config-20
+    REQUIRED)
 
-find_package(LLVM REQUIRED CONFIG
-    PATHS ${LLVM_BUILD_DIR}
-    NO_DEFAULT_PATH)
+function(run_llvm_config out_var)
+    execute_process(
+        COMMAND "${LLVM_CONFIG}" ${ARGN}
+        RESULT_VARIABLE cmd_status
+        OUTPUT_VARIABLE cmd_output
+        ERROR_VARIABLE cmd_error
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT cmd_status EQUAL 0)
+        message(FATAL_ERROR "llvm-config ${ARGN} failed: ${cmd_error}")
+    endif()
+    set(${out_var} "${cmd_output}" PARENT_SCOPE)
+endfunction()
 
-message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+run_llvm_config(LLVM_INCLUDE_DIR  --includedir)
+run_llvm_config(LLVM_OBJ_ROOT     --obj-root)
+run_llvm_config(LLVM_CXXFLAGS     --cxxflags)
+run_llvm_config(LLVM_LDFLAGS      --ldflags)
+run_llvm_config(LLVM_SHARED_MODE  --shared-mode)
+run_llvm_config(LLVM_LIBS         --libs core passes support)
+run_llvm_config(LLVM_SYSTEM_LIBS  --system-libs)
 
-include(AddLLVM)
-include_directories(${LLVM_INCLUDE_DIRS})
-include_directories(/home/whu_zsz/compiler_contest/llvm-project/build/include)
-add_definitions(${LLVM_DEFINITIONS})
+separate_arguments(LLVM_CXXFLAGS_LIST  UNIX_COMMAND "${LLVM_CXXFLAGS}")
+separate_arguments(LLVM_LDFLAGS_LIST   UNIX_COMMAND "${LLVM_LDFLAGS}")
+separate_arguments(LLVM_LIBS_LIST      UNIX_COMMAND "${LLVM_LIBS}")
+separate_arguments(LLVM_SYSTEM_LIBS_LIST UNIX_COMMAND "${LLVM_SYSTEM_LIBS}")
 
-# Pass动态库，输出到 build/pass/libcontestant_pass.so
-add_llvm_pass_plugin(contestant_pass
-    lib/CholeleskyPass.cpp
-)
+list(FILTER LLVM_CXXFLAGS_LIST EXCLUDE REGEX "^-std=")
+list(FILTER LLVM_CXXFLAGS_LIST EXCLUDE REGEX "^-I")
+
+# ── Pass 动态库 ────────────────────────────────────
+add_library(contestant_pass MODULE lib/CholeleskyPass.cpp)
+target_compile_features(contestant_pass PRIVATE cxx_std_17)
+
+# includedir（源码头文件）+ obj-root/include（生成头文件，如 abi-breaking.h）
+target_include_directories(contestant_pass SYSTEM PRIVATE
+    "${LLVM_INCLUDE_DIR}"
+    "${LLVM_OBJ_ROOT}/include")
+
+target_compile_options(contestant_pass PRIVATE ${LLVM_CXXFLAGS_LIST})
+target_link_options(contestant_pass PRIVATE ${LLVM_LDFLAGS_LIST})
+
+if(NOT LLVM_SHARED_MODE STREQUAL "static")
+    target_link_libraries(contestant_pass PRIVATE
+        ${LLVM_LIBS_LIST} ${LLVM_SYSTEM_LIBS_LIST})
+endif()
+
 set_target_properties(contestant_pass PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/pass"
-)
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/pass")
 
-# 运行时静态库，输出到 build/runtime/libcontestant_runtime.a
-add_library(contestant_runtime STATIC
-    runtime/runtime.c
-)
+# ── 运行时静态库 ───────────────────────────────────
+add_library(contestant_runtime STATIC runtime/runtime.c)
 target_include_directories(contestant_runtime PUBLIC runtime/)
-target_compile_options(contestant_runtime PRIVATE -O2 -std=c11)
+target_compile_options(contestant_runtime PRIVATE -O2)
 target_link_libraries(contestant_runtime pthread)
 set_target_properties(contestant_runtime PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/runtime"
-    OUTPUT_NAME "contestant_runtime"
-)
+    OUTPUT_NAME "contestant_runtime")
 
-# 复制manifest.json到build目录
+# ── 复制 manifest ──────────────────────────────────
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/manifest.json
     ${CMAKE_BINARY_DIR}/manifest.json
-    COPYONLY
-)
+    COPYONLY)
