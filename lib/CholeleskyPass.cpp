@@ -94,7 +94,7 @@ struct CholeleskyPass : PassInfoMixin<CholeleskyPass> {
             BasicBlock &EntryBB = F.getEntryBlock();
             IRBuilder<> EntryBuilder(&*EntryBB.getFirstInsertionPt());
             EntryBuilder.CreateCall(RuntimeInit,
-                {ConstantInt::get(Int32Ty, 8)});
+                {ConstantInt::get(Int32Ty, 0)});
 
             // 预分配每个task的args/reads数组和整数slot
             // 这些alloca全部放在入口块，不随循环迭代重复分配
