@@ -157,7 +157,6 @@ static void rmap_clear(RMap *m, void *key) {
 
 // ── Task结构体 ────────────────────────────────────
 #define INIT_SUCCS_CAP 8
-#define INIT_DEPS_CAP 8
 
 typedef struct {
     void   (*func)(void**);
@@ -171,7 +170,6 @@ typedef struct {
     int     succ_cap;
     int    *deps;       // 指向pool分配的内存（依赖数量有上界）
     int     ndeps;
-    int     deps_cap;
     atomic_int dep_count;
     atomic_int done;
 } Task;
@@ -218,8 +216,7 @@ static void add_dep(int from_id, int to_id) {
     Task *to   = &tasks[to_id];
     for (int i = 0; i < to->ndeps; i++)
         if (to->deps[i] == from_id) return;
-    if(to->ndeps>=to->deps_cap){to->deps_cap*=2;to->deps=(int*)realloc(to->deps,to->deps_cap*4);}
-    to->deps[to->ndeps++]=from_id;
+    to->deps[to->ndeps++] = from_id;
     task_push_succ(from, to_id);
 }
 
@@ -300,13 +297,13 @@ void runtime_init(int num_threads) {
 }
 
 void runtime_submit(void (*func)(void**), void **args, int nargs,
-                    void *write_ptr, void **read_ptrs, int nreads) {
+                    void **write_ptrs, int nwrites, void **read_ptrs, int nreads) {
     ensure_tasks_capacity(ntasks + 1);
     Task *t = &tasks[ntasks];
 
     t->func      = func;
     t->nargs     = nargs;
-    t->write_ptr = write_ptr;
+    t->write_ptr = write_ptrs[0];
     t->nreads    = nreads;
     t->nsuccs    = 0;
     t->succ_cap  = INIT_SUCCS_CAP;
@@ -321,8 +318,7 @@ void runtime_submit(void (*func)(void**), void **args, int nargs,
     for (int i = 0; i < nreads; i++) t->read_ptrs[i] = read_ptrs[i];
 
     // deps最多和历史任务数一样多，但实际很小，预分配8个
-    t->deps=(int*)malloc(INIT_DEPS_CAP*sizeof(int));
-    t->deps_cap=INIT_DEPS_CAP;
+    t->deps  = (int*)pool_alloc(&pool, 8 * sizeof(int));
     t->succs = (int*)malloc(INIT_SUCCS_CAP * sizeof(int));
 
     // O(1) 依赖分析
@@ -330,25 +326,23 @@ void runtime_submit(void (*func)(void**), void **args, int nargs,
         int p = hashmap_get(&last_writer, read_ptrs[r]);
         if (p != HASH_EMPTY) add_dep(p, ntasks);
     }
-    {
-        int p = hashmap_get(&last_writer, write_ptr);
+    for (int w = 0; w < nwrites; w++) {
+        void *wp = write_ptrs[w];
+        int p = hashmap_get(&last_writer, wp);
         if (p != HASH_EMPTY) add_dep(p, ntasks);
-    }
-    {
-        int s = hslot(readers.size, write_ptr);
+        int s = hslot(readers.size, wp);
         for (int i = 0; i < readers.size; i++) {
             int idx = (s + i) & (readers.size - 1);
             if (!readers.buckets[idx].key) break;
-            if (readers.buckets[idx].key == write_ptr) {
+            if (readers.buckets[idx].key == wp) {
                 for (int j = 0; j < readers.buckets[idx].nvals; j++)
                     add_dep(readers.buckets[idx].vals[j], ntasks);
                 break;
             }
         }
+        hashmap_set(&last_writer, wp, ntasks);
+        rmap_clear(&readers, wp);
     }
-
-    hashmap_set(&last_writer, write_ptr, ntasks);
-    rmap_clear(&readers, write_ptr);
     for (int r = 0; r < nreads; r++) rmap_append(&readers, read_ptrs[r], ntasks);
 
     atomic_store(&t->dep_count, t->ndeps);
@@ -367,8 +361,9 @@ void runtime_wait_all() {
     for (int i = 0; i < nthreads; i++)
         pthread_join(thread_pool[i], NULL);
 
-    for(int i=0;i<ntasks;i++){free(tasks[i].succs);free(tasks[i].deps);}
-    ntasks=0;
+    for (int i = 0; i < ntasks; i++)
+        free(tasks[i].succs);  // 只释放succs（其余由pool管理）
+    ntasks = 0;
     atomic_store(&finished_count, 0);
 
     pool_free(&pool);
@@ -377,6 +372,7 @@ void runtime_wait_all() {
     queue_destroy(&queue);
 }
 
+void *runtime_alloc(int bytes){return pool_alloc(&pool,(size_t)bytes);}
 void runtime_destroy() {
     free(thread_pool); thread_pool = NULL;
     free(tasks); tasks = NULL; tasks_capacity = 0;
@@ -394,6 +390,11 @@ void trsm_wrapper(void **args) {
          *(int*)args[3], *(int*)args[4]);
 }
 void madd_wrapper(void **args) {
-    madd((double*)args[0], (double*)args[1], (double*)args[2],
-         *(int*)args[3], *(int*)args[4]);
+    madd((double*)args[0], (double*)args[1], (double*)args[2],*(int*)args[3],*(int*)args[4]);
+}
+void madd_batch_wrapper(void **args){
+    double**A=(double**)(args[0]);
+    long long b=(long long)args[1],lda=(long long)args[2],n=(long long)args[3];
+    double**B=(double**)(args[4]),**C=(double**)(args[5]);
+    for(int i=0;i<(int)n;i++)madd(A[i],B[i],C[i],(int)b,(int)lda);
 }

@@ -157,7 +157,6 @@ static void rmap_clear(RMap *m, void *key) {
 
 // ── Task结构体 ────────────────────────────────────
 #define INIT_SUCCS_CAP 8
-#define INIT_DEPS_CAP 8
 
 typedef struct {
     void   (*func)(void**);
@@ -171,7 +170,6 @@ typedef struct {
     int     succ_cap;
     int    *deps;       // 指向pool分配的内存（依赖数量有上界）
     int     ndeps;
-    int     deps_cap;
     atomic_int dep_count;
     atomic_int done;
 } Task;
@@ -218,8 +216,7 @@ static void add_dep(int from_id, int to_id) {
     Task *to   = &tasks[to_id];
     for (int i = 0; i < to->ndeps; i++)
         if (to->deps[i] == from_id) return;
-    if(to->ndeps>=to->deps_cap){to->deps_cap*=2;to->deps=(int*)realloc(to->deps,to->deps_cap*4);}
-    to->deps[to->ndeps++]=from_id;
+    to->deps[to->ndeps++] = from_id;
     task_push_succ(from, to_id);
 }
 
@@ -321,8 +318,7 @@ void runtime_submit(void (*func)(void**), void **args, int nargs,
     for (int i = 0; i < nreads; i++) t->read_ptrs[i] = read_ptrs[i];
 
     // deps最多和历史任务数一样多，但实际很小，预分配8个
-    t->deps=(int*)malloc(INIT_DEPS_CAP*sizeof(int));
-    t->deps_cap=INIT_DEPS_CAP;
+    t->deps  = (int*)pool_alloc(&pool, 8 * sizeof(int));
     t->succs = (int*)malloc(INIT_SUCCS_CAP * sizeof(int));
 
     // O(1) 依赖分析
@@ -367,8 +363,9 @@ void runtime_wait_all() {
     for (int i = 0; i < nthreads; i++)
         pthread_join(thread_pool[i], NULL);
 
-    for(int i=0;i<ntasks;i++){free(tasks[i].succs);free(tasks[i].deps);}
-    ntasks=0;
+    for (int i = 0; i < ntasks; i++)
+        free(tasks[i].succs);  // 只释放succs（其余由pool管理）
+    ntasks = 0;
     atomic_store(&finished_count, 0);
 
     pool_free(&pool);

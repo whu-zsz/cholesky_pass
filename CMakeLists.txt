@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ── 查找 LLVM ──────────────────────────────────────
 find_program(LLVM_CONFIG
-    NAMES llvm-config llvm-config-17 llvm-config-18 llvm-config-19 llvm-config-20
+    NAMES llvm-config llvm-config-15 llvm-config-17 llvm-config-18 llvm-config-19 llvm-config-20
     REQUIRED)
 
 function(run_llvm_config out_var)
